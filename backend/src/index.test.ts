@@ -45,7 +45,19 @@ describe("StellarKraal API", () => {
 
     it("returns 500 for missing fields", async () => {
       const res = await request(app).post("/api/collateral/register").send({});
-      expect(res.status).toBe(500);
+      expect(res.status).toBe(400);
+      expect(res.body).toHaveProperty("error", "Validation failed");
+    });
+
+    it("returns 400 for invalid Stellar public key", async () => {
+      const res = await request(app).post("/api/collateral/register").send({
+        owner: "INVALID_KEY",
+        animal_type: "cattle",
+        count: 5,
+        appraised_value: 1000000,
+      });
+      expect(res.status).toBe(400);
+      expect(res.body).toHaveProperty("error", "Validation failed");
     });
   });
 
