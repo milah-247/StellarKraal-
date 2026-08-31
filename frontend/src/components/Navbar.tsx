@@ -1,15 +1,25 @@
 "use client";
 import { useState, useRef, useEffect } from "react";
+import FocusTrap from "focus-trap-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import {
+  LayoutDashboard,
+  ClipboardList,
+  Beef,
+  Settings,
+} from "lucide-react";
+import { Icon } from "@/components/Icon";
 import ThemeToggle from "./ThemeToggle";
 import { useWallet } from "@/hooks/useWallet";
+import { useAtRiskLoans } from "@/hooks/useAtRiskLoans";
+import NotificationBadge from "@/components/NotificationBadge";
 
 const NAV_SECTIONS = [
-  { href: "/dashboard", label: "Dashboard", icon: "⊞" },
-  { href: "/loans", label: "Loans", icon: "📋" },
-  { href: "/collateral", label: "Collateral", icon: "🐄" },
-  { href: "/settings", label: "Settings", icon: "⚙" },
+  { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
+  { href: "/loans", label: "Loans", icon: ClipboardList },
+  { href: "/collateral", label: "Collateral", icon: Beef },
+  { href: "/settings", label: "Settings", icon: Settings },
 ] as const;
 
 /**
@@ -24,6 +34,12 @@ const NAV_SECTIONS = [
  * Design token colours satisfy WCAG AA contrast on the nav background
  * in both light mode (#5D3C15 on #FEFCF8 — ~10.8:1) and dark mode
  * (#F0D9B8 on #2A1B0B — ~10.4:1).
+ *
+ * Icons — #801: lucide-react replaces all emoji. Each icon is decorative
+ * (aria-hidden) because the link label is visible text.
+ *
+ * Notification badge — #803: a red badge on the Dashboard link when any loan
+ * has health factor < 1.2.
  */
 
 export default function Navbar() {
@@ -32,6 +48,7 @@ export default function Navbar() {
   const walletDropdownRef = useRef<HTMLDivElement>(null);
   const pathname = usePathname();
   const { address, connect, disconnect } = useWallet();
+  const { atRiskCount } = useAtRiskLoans();
 
   // Close wallet dropdown when clicking outside
   useEffect(() => {
@@ -55,6 +72,11 @@ export default function Navbar() {
     ? `${address.slice(0, 4)}…${address.slice(-4)}`
     : null;
 
+  // Suppress unused-var lint warnings for wallet actions used in future UI
+  void connect;
+  void disconnect;
+  void truncatedAddress;
+
   return (
     <nav
       aria-label="Main navigation"
@@ -68,10 +90,11 @@ export default function Navbar() {
         {/* Brand */}
         <Link
           href="/"
-          className="font-bold text-lg flex items-center min-h-[44px]"
+          className="font-bold text-lg flex items-center gap-2 min-h-[44px]"
           style={{ color: "var(--color-text)" }}
         >
-          🐄 StellarKraal
+          <Icon icon={Beef} size="md" aria-hidden="true" className="text-current" />
+          StellarKraal
         </Link>
 
         {/* Desktop nav */}
@@ -79,6 +102,7 @@ export default function Navbar() {
           {NAV_SECTIONS.map(({ href, label, icon }) => {
             const active =
               pathname === href || pathname.startsWith(href + "/");
+            const isDashboard = href === "/dashboard";
             return (
               <li key={href}>
                 {/*
@@ -91,7 +115,7 @@ export default function Navbar() {
                   href={href}
                   aria-current={active ? "page" : undefined}
                   className={[
-                    "flex items-center gap-1.5 px-3 min-h-[44px] rounded-lg transition font-medium",
+                    "relative flex items-center gap-1.5 px-3 min-h-[44px] rounded-lg transition font-medium",
                     active
                       ? "border-b-[3px] font-bold"
                       : "hover:bg-[color:var(--token-primary)]/5",
@@ -112,8 +136,13 @@ export default function Navbar() {
                         }
                   }
                 >
-                  <span aria-hidden="true">{icon}</span>
+                  {/* lucide icon — decorative, label is the visible text */}
+                  <Icon icon={icon} size="sm" className="text-current" />
                   {label}
+                  {/* #803: notification badge on dashboard link */}
+                  {isDashboard && atRiskCount > 0 && (
+                    <NotificationBadge count={atRiskCount} />
+                  )}
                 </Link>
               </li>
             );
@@ -155,54 +184,91 @@ export default function Navbar() {
         </div>
       </div>
 
-      {/* Mobile drawer */}
+      {/* Mobile drawer (#524) */}
       {open && (
-        <ul
-          id="mobile-menu"
-          className="md:hidden flex flex-col border-t py-2"
-          style={{ borderColor: "var(--color-nav-border)" }}
-          role="list"
-        >
-          {NAV_SECTIONS.map(({ href, label, icon }) => {
-            const active =
-              pathname === href || pathname.startsWith(href + "/");
-            return (
-              <li key={href}>
-                {/*
-                 * Mobile active state (#781):
-                 * — left border pill (4 px) instead of bottom to suit the vertical layout
-                 * — same token colours as desktop
-                 */}
-                <Link
-                  href={href}
-                  aria-current={active ? "page" : undefined}
-                  onClick={() => setOpen(false)}
-                  className={[
-                    "flex items-center gap-2 px-4 min-h-[44px] transition font-medium",
-                    active ? "border-l-4 font-bold" : "hover:bg-[var(--color-border)]",
-                  ]
-                    .filter(Boolean)
-                    .join(" ")}
-                  style={
-                    active
-                      ? {
-                          color: "var(--token-primary)",
-                          borderLeftColor: "var(--token-primary)",
-                          backgroundColor:
-                            "color-mix(in srgb, var(--token-primary) 8%, transparent)",
+        <>
+          {/* Overlay — tapping it dismisses the drawer, same as the close button */}
+          <div
+            className="md:hidden fixed inset-0 z-40 bg-black/40"
+            aria-hidden="true"
+            onClick={() => setOpen(false)}
+          />
+          {/*
+           * Focus is trapped inside the open drawer (#524) so keyboard users
+           * can't tab into content hidden behind the overlay. Escape and an
+           * outside click both close it via onDeactivate.
+           */}
+          <FocusTrap
+            active={open}
+            focusTrapOptions={{
+              onDeactivate: () => setOpen(false),
+              clickOutsideDeactivates: true,
+              escapeDeactivates: true,
+              fallbackFocus: "#mobile-menu",
+            }}
+          >
+            <div
+              id="mobile-menu"
+              role="dialog"
+              aria-modal="true"
+              aria-label="Mobile navigation menu"
+              tabIndex={-1}
+              className="md:hidden fixed inset-x-0 top-14 z-50 border-t shadow-lg"
+              style={{
+                borderColor: "var(--color-nav-border)",
+                backgroundColor: "var(--color-nav-bg)",
+              }}
+            >
+              <ul className="flex flex-col py-2" role="list">
+                {NAV_SECTIONS.map(({ href, label, icon }) => {
+                  const active =
+                    pathname === href || pathname.startsWith(href + "/");
+                  const isDashboard = href === "/dashboard";
+                  return (
+                    <li key={href}>
+                      {/*
+                       * Mobile active state (#781):
+                       * — left border pill (4 px) instead of bottom to suit the vertical layout
+                       * — same token colours as desktop
+                       */}
+                      <Link
+                        href={href}
+                        aria-current={active ? "page" : undefined}
+                        onClick={() => setOpen(false)}
+                        className={[
+                          "relative flex items-center gap-2 px-4 min-h-[44px] transition font-medium",
+                          active ? "border-l-4 font-bold" : "hover:bg-[var(--color-border)]",
+                        ]
+                          .filter(Boolean)
+                          .join(" ")}
+                        style={
+                          active
+                            ? {
+                                color: "var(--token-primary)",
+                                borderLeftColor: "var(--token-primary)",
+                                backgroundColor:
+                                  "color-mix(in srgb, var(--token-primary) 8%, transparent)",
+                              }
+                            : {
+                                color: "var(--token-text-muted)",
+                              }
                         }
-                      : {
-                          color: "var(--token-text-muted)",
-                        }
-                  }
-                >
-                  <span aria-hidden="true">{icon}</span>
-                  {label}
-                </Link>
-              </li>
-            );
-          })}
-        </ul>
+                      >
+                        {/* lucide icon — decorative */}
+                        <Icon icon={icon} size="sm" className="text-current" />
+                        {label}
+                        {/* #803: notification badge on dashboard link in mobile menu */}
+                        {isDashboard && atRiskCount > 0 && (
+                          <NotificationBadge count={atRiskCount} />
+                        )}
+                      </Link>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          </FocusTrap>
+        </>
       )}
     </nav>
   );

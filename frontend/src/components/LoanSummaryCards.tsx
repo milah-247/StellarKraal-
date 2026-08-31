@@ -1,7 +1,8 @@
-"use client";
+'use client';
 
-import AnimatedCounter from "@/components/AnimatedCounter";
-import Card from "@/components/Card";
+import AnimatedCounter from '@/components/AnimatedCounter';
+import Card from '@/components/Card';
+import { formatXlm } from '@/lib/formatMoney';
 
 interface LoanSummary {
   /** Total loan principal in base units. */
@@ -19,10 +20,7 @@ interface LoanSummaryCardsProps {
 }
 
 function formatAmount(n: number): string {
-  return new Intl.NumberFormat("en-US", {
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 2,
-  }).format(n / 1_000_000); // assume base units are micro-XLM
+  return formatXlm(n / 1_000_000); // assume base units are micro-XLM
 }
 
 const METRICS: {
@@ -32,28 +30,28 @@ const METRICS: {
   ariaLabel: string;
 }[] = [
   {
-    key: "totalPrincipal",
-    label: "Total Principal",
+    key: 'totalPrincipal',
+    label: 'Total Principal',
     formatter: formatAmount,
-    ariaLabel: "Total principal in XLM",
+    ariaLabel: 'Total principal in XLM',
   },
   {
-    key: "outstanding",
-    label: "Outstanding Balance",
+    key: 'outstanding',
+    label: 'Outstanding Balance',
     formatter: formatAmount,
-    ariaLabel: "Outstanding balance in XLM",
+    ariaLabel: 'Outstanding balance in XLM',
   },
   {
-    key: "interestAccrued",
-    label: "Interest Accrued",
+    key: 'interestAccrued',
+    label: 'Interest Accrued',
     formatter: formatAmount,
-    ariaLabel: "Total interest accrued in XLM",
+    ariaLabel: 'Total interest accrued in XLM',
   },
   {
-    key: "activeLoanCount",
-    label: "Active Loans",
+    key: 'activeLoanCount',
+    label: 'Active Loans',
     formatter: (n) => n.toLocaleString(),
-    ariaLabel: "Number of active loans",
+    ariaLabel: 'Number of active loans',
   },
 ];
 
@@ -65,7 +63,7 @@ const METRICS: {
  */
 export default function LoanSummaryCards({ summary }: LoanSummaryCardsProps) {
   return (
-    <section aria-label="Loan summary">
+    <section aria-label="Loan summary" data-print-section="loan-summary" className="loan-summary-print">
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         {METRICS.map(({ key, label, formatter, ariaLabel }) => (
           <Card key={key}>

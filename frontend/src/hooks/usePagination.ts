@@ -1,7 +1,7 @@
 import { useCallback } from 'react';
 import { useRouter, useSearchParams, usePathname } from 'next/navigation';
 
-export const PAGE_SIZE_OPTIONS = [10, 25, 50] as const;
+export const PAGE_SIZE_OPTIONS = [10, 20, 50] as const;
 export type PageSize = (typeof PAGE_SIZE_OPTIONS)[number];
 
 export interface PaginationState {
@@ -13,13 +13,13 @@ export interface PaginationState {
   slice: <T>(items: T[]) => T[];
 }
 
-export function usePagination(totalItems: number): PaginationState {
+export function usePagination(totalItems: number, defaultLimit: PageSize = 10): PaginationState {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
 
   const rawPage = parseInt(searchParams.get('page') ?? '1', 10);
-  const rawLimit = parseInt(searchParams.get('limit') ?? '10', 10);
+  const rawLimit = parseInt(searchParams.get('limit') ?? String(defaultLimit), 10);
 
   const limit: PageSize = (PAGE_SIZE_OPTIONS as readonly number[]).includes(rawLimit)
     ? (rawLimit as PageSize)

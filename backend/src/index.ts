@@ -23,13 +23,14 @@ import {
   insertLoan,
   getLoan,
   listLoans,
+  listActiveLoans,
   updateLoan,
   softDeleteLoan,
   restoreLoan,
   listDeletedLoans,
+  insertTransaction,
   listTransactions,
   getTransaction,
-  updateCollateral,
   insertAuditEntry,
   listAuditEntries,
   getProfile,
@@ -388,7 +389,7 @@ async function buildContractTx(
     .build();
 
   try {
-    const prepared = await rpcClient.prepareTransaction(tx);
+    const prepared = await rpcClient.prepareTransaction(tx) as any;
     return prepared.toXDR();
   } catch (err) {
     throw mapSorobanError(err);
@@ -1412,25 +1413,27 @@ app.patch(
 
     const updates = validation.data;
 
+    const id = req.params.id as string;
+
     if (updates.appraised_value !== undefined && updates.appraised_value <= 0) {
       return res.status(400).json({ error: 'appraised_value must be positive' });
     }
 
-    const record = getCollateral(req.params.id);
+    const record = getCollateral(id);
     if (!record) return res.status(404).json({ error: 'Record not found' });
 
     // 409: pledged to active loan and appraised_value is being reduced
     if (
       updates.appraised_value !== undefined &&
       updates.appraised_value < record.appraised_value &&
-      isCollateralPledged(req.params.id)
+      isCollateralPledged(id)
     ) {
       return res.status(409).json({
         error: 'Cannot reduce appraised_value: collateral is pledged to an active loan',
       });
     }
 
-    const updated = updateCollateral(req.params.id, updates);
+    const updated = updateCollateral(id, updates);
     if (!updated) return res.status(404).json({ error: 'Record not found' });
 
     // Audit log entry
@@ -1439,7 +1442,7 @@ app.patch(
       userId: user?.publicKey ?? 'anonymous',
       action: 'collateral.patch',
       resource: 'collateral',
-      resourceId: req.params.id,
+      resourceId: id,
       requestBody: redact(updates),
       ip: req.ip,
     });
@@ -1731,6 +1734,92 @@ app.put(
 );
 
 // ── User Profile ──────────────────────────────────────────────────────────────
+
+/**
+ * @openapi
+ * /profile:
+ *   get:
+ *     tags:
+ *       - profile
+ *     summary: Get the authenticated user's profile
+ *     description: Returns the caller's own profile, including wallet address, display name, join date, and loan/collateral counts. First login auto-creates the underlying profile record.
+ *     operationId: getProfile
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       '200':
+ *         description: Profile found
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               description: User profile summary.
+ *               properties:
+ *                 walletAddress:
+ *                   type: string
+ *                   description: Stellar G... public key
+ *                   example: GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN
+ *                 displayName:
+ *                   type: string
+ *                   description: User-chosen display name
+ *                   example: Alice
+ *                 joinedAt:
+ *                   type: string
+ *                   description: ISO timestamp the profile was first created
+ *                   example: 2026-01-15T10:00:00.000Z
+ *                 loanCount:
+ *                   type: integer
+ *                   description: Total number of loans belonging to this user
+ *                   example: 3
+ *                 collateralCount:
+ *                   type: integer
+ *                   description: Total number of collateral records owned by this user
+ *                   example: 2
+ *       '401':
+ *         $ref: '#/components/responses/Unauthorized'
+ *       '404':
+ *         description: No profile record exists for this user yet
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 error:
+ *                   type: string
+ *                 message:
+ *                   type: string
+ */
+app.get(
+  '/api/v1/profile',
+  asyncHandler(async (req: Request, res: Response) => {
+    const user = (req as any).user as { publicKey?: string } | undefined;
+    if (!user?.publicKey) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+
+    const profile = getProfile(user.publicKey);
+    if (!profile) {
+      return res
+        .status(404)
+        .json({ error: 'Not found', message: 'No profile exists for this user yet' });
+    }
+
+    const { total: loanCount } = listLoans({ borrowerAddress: user.publicKey, page: 1, limit: 1 });
+    const { total: collateralCount } = listCollateral({
+      ownerId: user.publicKey,
+      page: 1,
+      limit: 1,
+    });
+
+    res.json({
+      walletAddress: profile.walletAddress,
+      displayName: profile.displayName,
+      joinedAt: profile.createdAt,
+      loanCount,
+      collateralCount,
+    });
+  })
+);
 
 /**
  * PATCH /api/v1/profile
