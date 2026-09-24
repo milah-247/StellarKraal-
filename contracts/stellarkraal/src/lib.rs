@@ -57,6 +57,9 @@ const WL_COUNT: Symbol = symbol_short!("WLCOUNT");  // number of whitelisted liq
 const MIN_LOAN: Symbol = symbol_short!("MINLOAN"); // minimum loan amount in stroops
 const MAX_LOAN: Symbol = symbol_short!("MAXLOAN"); // maximum loan amount in stroops
 
+// ── Issue #1046 storage key ───────────────────────────────────────────────────
+const LIQ_BONUS: Symbol = symbol_short!("LIQBONUS"); // liquidation bonus bps e.g. 500 = 5%
+
 // ── Issue #669 storage keys ──────────────────────────────────────────────────
 const PNDG_WASM: Symbol = symbol_short!("PNDGWASM");
 const UPG_TIME: Symbol = symbol_short!("UPGTIME");
@@ -117,12 +120,19 @@ pub enum Error {
     ExceedsCloseFactor = 11,
     /// Close factor must be between 1 and 10 000 bps.
     InvalidCloseFactor = 12,
+    /// Contract is currently paused — new operations are blocked.
     ContractPaused = 13,
+    /// Oracle is already in the trusted list.
     OracleAlreadyRegistered = 14,
+    /// Trusted oracle list is full (max 5).
     OracleLimitReached = 15,
+    /// Oracle address not found in the trusted list.
     OracleNotFound = 16,
+    /// Not enough oracles have submitted prices to meet the quorum.
     InsufficientOracleQuorum = 17,
+    /// Submitted price is out of the valid range.
     InvalidPrice = 18,
+    /// `unpause` called while the contract is not paused.
     NotPaused = 19,
     /// Reentrancy guard: another call is already in progress.
     AlreadyInProgress = 20,
@@ -138,6 +148,8 @@ pub enum Error {
     TimelockNotElapsed = 25,
     /// `remove_oracle` would leave zero oracles while active loans exist.
     OracleRequired = 26,
+    /// Loan amount exceeds the per-collateral-type maximum LTV ratio (#1044).
+    ExceedsMaxLtv = 27,
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -288,6 +300,10 @@ pub enum DataKey {
     WhitelistEntry(Address),
     /// Per-animal-type maximum appraised value cap.
     AnimalCap(Symbol),
+    /// Per-collateral-type maximum loan-to-value ratio in basis points (#1044).
+    CollateralMaxLtv(Symbol),
+    /// Most-recent price submitted by a specific oracle address (#1043).
+    OraclePrice(Address),
     /// Pending WASM hash for a proposed contract upgrade (issue #669).
     PendingWasm,
     /// Ledger timestamp when an upgrade was proposed (issue #669).
@@ -803,6 +819,24 @@ impl StellarKraal {
             total_collateral_value = total_collateral_value
                 .checked_add(collateral.appraised_value)
                 .ok_or(Error::InvalidAmount)?;
+
+            // ── Per-collateral-type max LTV check (#1044) ───────────────
+            // If a max LTV is configured for this animal type, ensure the
+            // requested amount does not exceed it against this collateral alone.
+            if let Some(max_ltv_bps) = env
+                .storage()
+                .persistent()
+                .get::<_, u32>(&DataKey::CollateralMaxLtv(collateral.animal_type.clone()))
+            {
+                let col_max = collateral
+                    .appraised_value
+                    .checked_mul(max_ltv_bps as i128)
+                    .ok_or(Error::InvalidAmount)?
+                    / 10_000;
+                if amount > col_max {
+                    return Err(Error::ExceedsMaxLtv);
+                }
+            }
         }
 
         let ltv: u32 = env.storage().instance().get(&LTV).unwrap();
@@ -1007,11 +1041,22 @@ impl StellarKraal {
             loan.status = LoanStatus::Liquidated;
         }
 
+        // ── Liquidation bonus (#1046) ──────────────────────────────────
+        // Collateral seized = repay_amount × (10_000 + bonus_bps) / 10_000,
+        // scaled by the ratio of total collateral to outstanding debt.
+        // This gives the liquidator a premium above the debt they repaid,
+        // incentivising timely liquidations.
+        let bonus_bps: u32 = env.storage().instance().get(&LIQ_BONUS).unwrap_or(0);
         let collateral_seized = if outstanding_before > 0 {
-            repay_amount
+            let base_seized = repay_amount
                 .checked_mul(loan.total_collateral_value)
                 .unwrap_or(0)
-                / outstanding_before
+                / outstanding_before;
+            // Apply bonus: base_seized × (10_000 + bonus_bps) / 10_000
+            base_seized
+                .checked_mul(10_000i128 + bonus_bps as i128)
+                .unwrap_or(base_seized)
+                / 10_000
         } else {
             0
         };
@@ -1025,8 +1070,12 @@ impl StellarKraal {
             (loan_id, liquidator.clone(), repay_amount, loan.outstanding, loan.status.clone()),
         );
 
-        // suppress unused-variable warning; collateral_seized is available to off-chain observers via events if needed
-        let _ = collateral_seized;
+        env.events().publish(
+            (symbol_short!("loan"), symbol_short!("liqbonus")),
+            (loan_id, collateral_seized, bonus_bps),
+        );
+
+        let _ = borrower;
 
         Ok(())
     }
@@ -1684,11 +1733,18 @@ impl StellarKraal {
 
     // ── submit_price ──────────────────────────────────────────────────────
     /// Submit a single price observation to update the TWAP.
+    ///
+    /// The caller must be either the legacy single-oracle address (`ORACLE`)
+    /// *or* any address in the trusted oracle list (`ORACLES`), satisfying
+    /// ADR-006's requirement for a multi-oracle setup (#1043).
     pub fn submit_price(env: Env, oracle: Address, price: i128) -> Result<(), Error> {
         Self::assert_initialized(&env)?;
         oracle.require_auth();
+        // Accept the legacy single oracle *or* any trusted oracle in the list.
         let stored_oracle: Address = env.storage().instance().get(&ORACLE).unwrap();
-        if oracle != stored_oracle {
+        let oracles = Self::get_oracles(env.clone());
+        let is_trusted = oracle == stored_oracle || oracles.contains(&oracle);
+        if !is_trusted {
             return Err(Error::Unauthorized);
         }
         if price <= 0 {
@@ -1838,6 +1894,233 @@ impl StellarKraal {
         );
 
         Ok(MIGRATION_VERSION)
+    }
+
+    // ── set_collateral_max_ltv (#1044) ────────────────────────────────
+    /// Set the maximum allowed loan-to-value ratio (in basis points) for a
+    /// specific collateral type.
+    ///
+    /// When set, `request_loan()` will reject any loan where the requested
+    /// amount exceeds `appraised_value × max_ltv_bps / 10_000` for *any*
+    /// individual collateral of that type.
+    ///
+    /// Passing `0` for `max_ltv_bps` *removes* the per-collateral cap so the
+    /// global LTV applies once more.
+    ///
+    /// # Access control
+    ///
+    /// Admin-only.
+    pub fn set_collateral_max_ltv(
+        env: Env,
+        admin: Address,
+        animal_type: Symbol,
+        max_ltv_bps: u32,
+    ) -> Result<(), Error> {
+        Self::assert_initialized(&env)?;
+        Self::assert_admin(&env, &admin)?;
+        admin.require_auth();
+
+        if max_ltv_bps > 10_000 {
+            return Err(Error::InvalidAmount);
+        }
+
+        if max_ltv_bps == 0 {
+            // Remove the per-collateral cap — fall back to global LTV.
+            env.storage()
+                .persistent()
+                .remove(&DataKey::CollateralMaxLtv(animal_type.clone()));
+        } else {
+            env.storage()
+                .persistent()
+                .set(&DataKey::CollateralMaxLtv(animal_type.clone()), &max_ltv_bps);
+            env.storage().persistent().extend_ttl(
+                &DataKey::CollateralMaxLtv(animal_type.clone()),
+                PERSISTENT_TTL_THRESHOLD,
+                PERSISTENT_TTL_LEDGERS,
+            );
+        }
+
+        env.events().publish(
+            (symbol_short!("Admin"), symbol_short!("MaxLtvSet")),
+            (animal_type, max_ltv_bps),
+        );
+        Ok(())
+    }
+
+    // ── get_collateral_max_ltv (#1044) ────────────────────────────────
+    /// Return the per-collateral-type max LTV in basis points, or `None` if
+    /// no cap has been set for that type (meaning the global LTV applies).
+    pub fn get_collateral_max_ltv(env: Env, animal_type: Symbol) -> Option<u32> {
+        env.storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::CollateralMaxLtv(animal_type))
+    }
+
+    // ── set_liquidation_bonus_bps (#1046) ─────────────────────────────
+    /// Set the liquidation bonus in basis points (e.g. 500 = 5 %).
+    ///
+    /// When a liquidator repays debt, they receive collateral worth
+    /// `repay_amount × (10_000 + bonus_bps) / 10_000` instead of
+    /// exactly `repay_amount`.  The bonus incentivises liquidators to
+    /// act promptly and keep the protocol solvent.
+    ///
+    /// Valid range: 0 – 5 000 bps (0 % – 50 %). Setting `0` disables the bonus.
+    ///
+    /// # Access control
+    ///
+    /// Admin-only.
+    pub fn set_liquidation_bonus_bps(
+        env: Env,
+        admin: Address,
+        bonus_bps: u32,
+    ) -> Result<(), Error> {
+        Self::assert_initialized(&env)?;
+        Self::assert_admin(&env, &admin)?;
+        admin.require_auth();
+
+        // Cap bonus at 50 % to prevent protocol insolvency.
+        if bonus_bps > 5_000 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let old_bonus: u32 = env.storage().instance().get(&LIQ_BONUS).unwrap_or(0);
+        env.storage().instance().set(&LIQ_BONUS, &bonus_bps);
+
+        env.events().publish(
+            (symbol_short!("Admin"), symbol_short!("LiqBonUpd")),
+            (old_bonus, bonus_bps),
+        );
+        Ok(())
+    }
+
+    // ── get_liquidation_bonus_bps (#1046) ─────────────────────────────
+    /// Return the current liquidation bonus in basis points.
+    ///
+    /// Returns `0` if no bonus has been configured.
+    pub fn get_liquidation_bonus_bps(env: Env) -> Result<u32, Error> {
+        Self::assert_initialized(&env)?;
+        Ok(env.storage().instance().get(&LIQ_BONUS).unwrap_or(0))
+    }
+
+    // ── submit_price_from_oracle (#1043) ──────────────────────────────
+    /// Submit a price from a single trusted oracle and trigger a median
+    /// recomputation across all oracle submissions for the current window.
+    ///
+    /// Unlike `submit_price` (which requires the single legacy `ORACLE`
+    /// address), this function:
+    ///
+    /// 1. Verifies `oracle` is in the registered trusted-oracle list.
+    /// 2. Stores the oracle's latest price in persistent storage.
+    /// 3. Collects all current oracle prices and computes the median.
+    /// 4. Updates `LAST_PRICE` and `LAST_PRICE_TIME` with the median.
+    ///
+    /// Once at least `min_quorum` oracles have submitted prices, the stored
+    /// price (used for health-factor and liquidation checks) becomes the
+    /// quorum-derived median rather than any individual oracle's reading.
+    /// This satisfies ADR-006's requirement to resist outlier manipulation.
+    pub fn submit_price_from_oracle(
+        env: Env,
+        oracle: Address,
+        price: i128,
+    ) -> Result<OracleReport, Error> {
+        Self::assert_initialized(&env)?;
+        oracle.require_auth();
+
+        if price <= 0 || price >= MAX_PRICE {
+            return Err(Error::InvalidPrice);
+        }
+
+        // 1. Verify this oracle is in the trusted list.
+        let oracles = Self::get_oracles(env.clone());
+        if !oracles.contains(&oracle) {
+            return Err(Error::Unauthorized);
+        }
+
+        // 2. Store the oracle's latest price.
+        env.storage()
+            .persistent()
+            .set(&DataKey::OraclePrice(oracle.clone()), &price);
+        env.storage().persistent().extend_ttl(
+            &DataKey::OraclePrice(oracle.clone()),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_LEDGERS,
+        );
+
+        // 3. Collect all current prices from the trusted oracle list.
+        let mut prices = Vec::new(&env);
+        for o in oracles.iter() {
+            if let Some(p) = env
+                .storage()
+                .persistent()
+                .get::<_, i128>(&DataKey::OraclePrice(o.clone()))
+            {
+                prices.push_back(p);
+            }
+        }
+
+        let responses = prices.len();
+        let min_quorum: u32 = env
+            .storage()
+            .instance()
+            .get(&MIN_QUORUM)
+            .unwrap_or(if oracles.len() >= 3 { 3 } else { oracles.len() });
+
+        if responses < min_quorum {
+            // Not enough oracles yet — store price without updating median.
+            return Ok(OracleReport {
+                median: price,
+                responses,
+                flagged_count: 0,
+            });
+        }
+
+        // 4. Compute median (insertion sort; list is capped at 5).
+        let mut arr = [0i128; 5];
+        for i in 0..responses {
+            arr[i as usize] = prices.get(i).unwrap();
+        }
+        for i in 0..responses {
+            for j in (i + 1)..responses {
+                if arr[i as usize] > arr[j as usize] {
+                    let tmp = arr[i as usize];
+                    arr[i as usize] = arr[j as usize];
+                    arr[j as usize] = tmp;
+                }
+            }
+        }
+        let median = if responses % 2 == 1 {
+            arr[(responses / 2) as usize]
+        } else {
+            let mid = (responses / 2) as usize;
+            (arr[mid - 1] + arr[mid]) / 2
+        };
+
+        // Count outlier submissions (> 50 % deviation from median).
+        let mut flagged_count = 0u32;
+        let dev_bps: u32 = env.storage().instance().get(&DEV_BPS).unwrap_or(2000);
+        for p in prices.iter() {
+            let diff = if p > median { p - median } else { median - p };
+            if median > 0 && diff * 10_000 > median * dev_bps as i128 {
+                flagged_count += 1;
+            }
+        }
+
+        // 5. Update the stored price to the median.
+        env.storage().instance().set(&LAST_PRICE, &median);
+        env.storage()
+            .instance()
+            .set(&LAST_PRICE_TIME, &env.ledger().timestamp());
+
+        env.events().publish(
+            (symbol_short!("oracle"), symbol_short!("median")),
+            (oracle, median, responses, flagged_count),
+        );
+
+        Ok(OracleReport {
+            median,
+            responses,
+            flagged_count,
+        })
     }
 
     // ── internal helpers ──────────────────────────────────────────────────

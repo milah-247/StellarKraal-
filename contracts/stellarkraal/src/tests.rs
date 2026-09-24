@@ -3190,3 +3190,425 @@ fn test_reappraise_nonexistent_collateral_fails() {
     let owner = Address::generate(&env);
     client.reappraise_collateral(&owner, &9999u64, &1_500_000i128);
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ── #1045 Admin governance ────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Admin can call parameter-update functions; non-admin is rejected.
+#[test]
+fn test_admin_can_set_ltv() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    client.set_ltv(&admin, &5000u32);
+    assert_eq!(client.get_ltv(), 5000);
+}
+
+#[test]
+#[should_panic(expected = "#3")]
+fn test_non_admin_cannot_set_ltv() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    let non_admin = Address::generate(&env);
+    client.set_ltv(&non_admin, &5000u32);
+}
+
+/// Admin can update the liquidation threshold; non-admin cannot.
+#[test]
+fn test_admin_can_set_liquidation_threshold() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    client.set_liquidation_threshold(&admin, &9000u32);
+    assert_eq!(client.get_liquidation_threshold(), 9000);
+}
+
+#[test]
+#[should_panic(expected = "#3")]
+fn test_non_admin_cannot_set_liquidation_threshold() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    let non_admin = Address::generate(&env);
+    client.set_liquidation_threshold(&non_admin, &9000u32);
+}
+
+/// Admin can add an oracle; non-admin cannot.
+#[test]
+fn test_admin_can_add_oracle() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    let new_oracle = Address::generate(&env);
+    client.add_oracle(&admin, &new_oracle);
+    let oracles = client.get_oracles();
+    assert!(oracles.contains(&new_oracle));
+}
+
+#[test]
+#[should_panic(expected = "#3")]
+fn test_non_admin_cannot_add_oracle() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    let non_admin = Address::generate(&env);
+    let new_oracle = Address::generate(&env);
+    client.add_oracle(&non_admin, &new_oracle);
+}
+
+/// Admin governance: two-step admin transfer requires both signatures.
+#[test]
+fn test_admin_transfer_two_step() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    let new_admin = Address::generate(&env);
+    client.propose_new_admin(&admin, &new_admin);
+    client.accept_admin_role(&new_admin);
+    // new_admin can now call admin-only functions
+    client.set_ltv(&new_admin, &5000u32);
+    assert_eq!(client.get_ltv(), 5000);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ── #1044 Per-collateral max LTV ──────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// set_collateral_max_ltv / get_collateral_max_ltv round-trip.
+#[test]
+fn test_set_and_get_collateral_max_ltv() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+
+    // No cap initially.
+    assert_eq!(client.get_collateral_max_ltv(&symbol_short!("cattle")), None);
+
+    // Set a 40 % cap for cattle.
+    client.set_collateral_max_ltv(&admin, &symbol_short!("cattle"), &4000u32);
+    assert_eq!(
+        client.get_collateral_max_ltv(&symbol_short!("cattle")),
+        Some(4000u32)
+    );
+}
+
+/// Loan within both global and per-collateral LTV succeeds.
+#[test]
+fn test_request_loan_within_per_collateral_ltv() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    // Override min loan to 1 so the test isn't blocked by the default floor.
+    client.set_loan_limits(&admin, &1i128, &1_000_000_000_000i128);
+    // Global LTV = 60 %, per-cattle LTV = 50 %
+    client.set_collateral_max_ltv(&admin, &symbol_short!("cattle"), &5000u32);
+    let borrower = Address::generate(&env);
+    let col_id =
+        client.register_livestock(&borrower, &symbol_short!("cattle"), &1u32, &1_000_000i128);
+    // 500_000 = 50 % of 1_000_000 — exactly at the cap, should succeed
+    let loan_id =
+        client.request_loan(&borrower, &vec![&env, col_id], &500_000i128, &None);
+    assert_eq!(loan_id, 1);
+}
+
+/// Loan that exceeds per-collateral max LTV is rejected with error #27.
+#[test]
+#[should_panic(expected = "#27")]
+fn test_request_loan_exceeds_per_collateral_ltv() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    // Override min loan to 1 so the test isn't blocked by the default floor.
+    client.set_loan_limits(&admin, &1i128, &1_000_000_000_000i128);
+    // Set a tight cap of 30 % for cattle.
+    client.set_collateral_max_ltv(&admin, &symbol_short!("cattle"), &3000u32);
+    let borrower = Address::generate(&env);
+    let col_id =
+        client.register_livestock(&borrower, &symbol_short!("cattle"), &1u32, &1_000_000i128);
+    // 500_000 = 50 % > 30 % cap — must be rejected.
+    client.request_loan(&borrower, &vec![&env, col_id], &500_000i128, &None);
+}
+
+/// Removing the per-collateral LTV cap (setting 0) reverts to global LTV.
+#[test]
+fn test_remove_per_collateral_ltv_cap() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    // Override min loan to 1 so the test isn't blocked by the default floor.
+    client.set_loan_limits(&admin, &1i128, &1_000_000_000_000i128);
+    client.set_collateral_max_ltv(&admin, &symbol_short!("cattle"), &3000u32);
+    // Remove the cap
+    client.set_collateral_max_ltv(&admin, &symbol_short!("cattle"), &0u32);
+    assert_eq!(client.get_collateral_max_ltv(&symbol_short!("cattle")), None);
+    // Now a loan at 50 % (within global 60 % LTV) should succeed
+    let borrower = Address::generate(&env);
+    let col_id =
+        client.register_livestock(&borrower, &symbol_short!("cattle"), &1u32, &1_000_000i128);
+    let loan_id =
+        client.request_loan(&borrower, &vec![&env, col_id], &500_000i128, &None);
+    assert_eq!(loan_id, 1);
+}
+
+/// Non-admin cannot set per-collateral max LTV.
+#[test]
+#[should_panic(expected = "#3")]
+fn test_non_admin_cannot_set_collateral_max_ltv() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    let non_admin = Address::generate(&env);
+    client.set_collateral_max_ltv(&non_admin, &symbol_short!("cattle"), &5000u32);
+}
+
+/// Max LTV above 100 % (10 000 bps) is rejected.
+#[test]
+#[should_panic(expected = "#8")]
+fn test_set_collateral_max_ltv_above_10000_fails() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    client.set_collateral_max_ltv(&admin, &symbol_short!("cattle"), &10_001u32);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ── #1043 Multi-oracle median aggregation ─────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// submit_price_from_oracle: single oracle below quorum stores price but
+/// does not update the global price yet.
+#[test]
+fn test_submit_price_from_oracle_below_quorum() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    // Use quorum=2 to require 2 oracle submissions.
+    let client = StellarKraalClient::new(&env, &cid);
+    client.initialize(&admin, &oracle, &token, &treasury, &6000u32, &8000u32, &2u32);
+
+    let oracle2 = Address::generate(&env);
+    client.add_oracle(&admin, &oracle2);
+
+    // oracle is the first trusted oracle (seeded from `ORACLE` key).
+    let report = client.submit_price_from_oracle(&oracle, &1_000i128);
+    // Quorum not yet met; median is returned as the single submitted price.
+    assert_eq!(report.median, 1_000i128);
+    assert_eq!(report.responses, 1u32);
+}
+
+/// submit_price_from_oracle: two oracles meet quorum → median is stored.
+#[test]
+fn test_submit_price_from_oracle_median_computed() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    let client = StellarKraalClient::new(&env, &cid);
+    client.initialize(&admin, &oracle, &token, &treasury, &6000u32, &8000u32, &2u32);
+
+    let oracle2 = Address::generate(&env);
+    client.add_oracle(&admin, &oracle2);
+
+    // First oracle submits price 1_000.
+    client.submit_price_from_oracle(&oracle, &1_000i128);
+    // Second oracle submits price 3_000 → median of [1000, 3000] = 2_000.
+    let report = client.submit_price_from_oracle(&oracle2, &3_000i128);
+    assert_eq!(report.median, 2_000i128);
+    assert_eq!(report.responses, 2u32);
+
+    // The stored price should now be the median.
+    let twap = client.get_twap_data();
+    assert_eq!(twap.current_price, 2_000i128);
+}
+
+/// submit_price_from_oracle: odd-count median (3 prices).
+#[test]
+fn test_submit_price_from_oracle_three_oracles_median() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    let client = StellarKraalClient::new(&env, &cid);
+    client.initialize(&admin, &oracle, &token, &treasury, &6000u32, &8000u32, &1u32);
+
+    let oracle2 = Address::generate(&env);
+    let oracle3 = Address::generate(&env);
+    client.add_oracle(&admin, &oracle2);
+    client.add_oracle(&admin, &oracle3);
+
+    // Use closely-spaced prices to avoid outlier flags (default DEV_BPS = 2000 = 20%).
+    client.submit_price_from_oracle(&oracle, &900i128);
+    client.submit_price_from_oracle(&oracle2, &1_100i128);
+    let report = client.submit_price_from_oracle(&oracle3, &1_000i128);
+    // Sorted: [900, 1000, 1100] → median = 1000.
+    assert_eq!(report.median, 1_000i128);
+    assert_eq!(report.responses, 3u32);
+    assert_eq!(report.flagged_count, 0u32);
+}
+
+/// submit_price_from_oracle: untrusted address is rejected.
+#[test]
+#[should_panic(expected = "#3")]
+fn test_submit_price_from_untrusted_oracle_fails() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    let untrusted = Address::generate(&env);
+    client.submit_price_from_oracle(&untrusted, &1_000i128);
+}
+
+/// submit_price: now accepts any trusted oracle in the list.
+#[test]
+fn test_submit_price_accepts_trusted_oracle_list_member() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    let oracle2 = Address::generate(&env);
+    client.add_oracle(&admin, &oracle2);
+    // oracle2 is now in the trusted list → submit_price should succeed.
+    client.submit_price(&oracle2, &500i128);
+    let twap = client.get_twap_data();
+    assert_eq!(twap.current_price, 500i128);
+}
+
+/// submit_price: non-oracle address is still rejected.
+#[test]
+#[should_panic(expected = "#3")]
+fn test_submit_price_non_oracle_rejected() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    let attacker = Address::generate(&env);
+    client.submit_price(&attacker, &1_000i128);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ── #1046 Liquidation bonus ───────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// set_liquidation_bonus_bps / get_liquidation_bonus_bps round-trip.
+#[test]
+fn test_set_and_get_liquidation_bonus() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+
+    // Default is 0.
+    assert_eq!(client.get_liquidation_bonus_bps(), 0u32);
+
+    // Set 5 % bonus.
+    client.set_liquidation_bonus_bps(&admin, &500u32);
+    assert_eq!(client.get_liquidation_bonus_bps(), 500u32);
+}
+
+/// Non-admin cannot set the liquidation bonus.
+#[test]
+#[should_panic(expected = "#3")]
+fn test_non_admin_cannot_set_liquidation_bonus() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    let non_admin = Address::generate(&env);
+    client.set_liquidation_bonus_bps(&non_admin, &500u32);
+}
+
+/// Bonus above 50 % (5 000 bps) is rejected.
+#[test]
+#[should_panic(expected = "#8")]
+fn test_set_liquidation_bonus_above_max_fails() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    client.set_liquidation_bonus_bps(&admin, &5_001u32);
+}
+
+/// Liquidation with a 10 % bonus emits a liqbonus event with the correct
+/// collateral_seized amount (= base_seized × 1.10).
+#[test]
+fn test_liquidate_with_bonus_emits_correct_event() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    // Override min loan to 1 so test amounts work.
+    client.set_loan_limits(&admin, &1i128, &1_000_000_000_000i128);
+
+    // Set 10 % liquidation bonus.
+    client.set_liquidation_bonus_bps(&admin, &1_000u32);
+
+    // Make a loan unhealthy.
+    let borrower = Address::generate(&env);
+    let liquidator = Address::generate(&env);
+    let col_id = client.register_livestock(
+        &borrower,
+        &symbol_short!("cattle"),
+        &1u32,
+        &1_000_000i128,
+    );
+    let loan_id =
+        client.request_loan(&borrower, &vec![&env, col_id], &600_000i128, &None);
+
+    // Drive outstanding above the liquidation threshold.
+    env.as_contract(&cid, || {
+        let mut loan: LoanRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Loan(loan_id))
+            .unwrap();
+        loan.outstanding = 900_000;
+        env.storage().persistent().set(&DataKey::Loan(loan_id), &loan);
+    });
+
+    let repay = 450_000i128;
+    client.liquidate(&liquidator, &loan_id, &repay);
+
+    // Verify the liqbonus event.
+    let events = env.events().all();
+    let bonus_topic = vec![
+        &env,
+        symbol_short!("loan").into_val(&env),
+        symbol_short!("liqbonus").into_val(&env),
+    ];
+    let bonus_event = events
+        .iter()
+        .rev()
+        .find(|e| e.1 == bonus_topic)
+        .expect("liqbonus event not emitted");
+
+    let data: (u64, i128, u32) = bonus_event.2.clone().into_val(&env);
+    assert_eq!(data.0, loan_id, "loan_id in event must match");
+    // base_seized = 450_000 * 1_000_000 / 900_000 = 500_000
+    // with_bonus = 500_000 * 11_000 / 10_000 = 550_000
+    assert_eq!(data.1, 550_000i128, "collateral_seized must include 10% bonus");
+    assert_eq!(data.2, 1_000u32, "bonus_bps must be 1_000");
+}
+
+/// Without a bonus, liquidate() works exactly as before.
+#[test]
+fn test_liquidate_without_bonus_works() {
+    let (env, cid, admin, oracle, token, treasury) = setup();
+    init(&env, &cid, &admin, &oracle, &token, &treasury);
+    let client = StellarKraalClient::new(&env, &cid);
+    // Override min loan to 1 so test amounts work.
+    client.set_loan_limits(&admin, &1i128, &1_000_000_000_000i128);
+
+    let borrower = Address::generate(&env);
+    let liquidator = Address::generate(&env);
+    let col_id = client.register_livestock(
+        &borrower,
+        &symbol_short!("cattle"),
+        &1u32,
+        &1_000_000i128,
+    );
+    let loan_id =
+        client.request_loan(&borrower, &vec![&env, col_id], &600_000i128, &None);
+
+    env.as_contract(&cid, || {
+        let mut loan: LoanRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Loan(loan_id))
+            .unwrap();
+        loan.outstanding = 900_000;
+        env.storage().persistent().set(&DataKey::Loan(loan_id), &loan);
+    });
+
+    client.liquidate(&liquidator, &loan_id, &300_000i128);
+
+    let loan = client.get_loan(&loan_id);
+    assert_eq!(loan.outstanding, 600_000i128);
+}
