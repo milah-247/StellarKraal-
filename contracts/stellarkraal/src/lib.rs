@@ -19,6 +19,41 @@ use soroban_sdk::{
     Env, String, Symbol, Vec,
 };
 
+pub fn compute_health_factor(
+    collateral_value: i128,
+    liquidation_threshold_bps: u32,
+    debt: i128,
+) -> Option<i128> {
+    if collateral_value <= 0 || debt <= 0 {
+        return None;
+    }
+    collateral_value
+        .checked_mul(liquidation_threshold_bps as i128)?
+        .checked_mul(10_000)?
+        .checked_div(debt)
+}
+
+pub fn compute_ltv(collateral_value: i128, ltv_bps: u32) -> Option<i128> {
+    if collateral_value <= 0 || ltv_bps == 0 || ltv_bps > 10_000 {
+        return None;
+    }
+    collateral_value.checked_mul(ltv_bps as i128)?.checked_div(10_000)
+}
+
+pub fn compute_interest_accrual(
+    outstanding: i128,
+    rate_bps: u32,
+    elapsed_seconds: u64,
+) -> Option<i128> {
+    if outstanding <= 0 || rate_bps == 0 || elapsed_seconds == 0 {
+        return None;
+    }
+    outstanding
+        .checked_mul(rate_bps as i128)?
+        .checked_mul(elapsed_seconds as i128)?
+        .checked_div(10_000i128 * 31_536_000i128)
+}
+
 // ── Storage keys ────────────────────────────────────────────────────────────
 const ADMIN: Symbol = symbol_short!("ADMIN");
 const ORACLE: Symbol = symbol_short!("ORACLE");
@@ -56,6 +91,7 @@ const WL_COUNT: Symbol = symbol_short!("WLCOUNT");  // number of whitelisted liq
 // ── Issue #700 storage keys ──────────────────────────────────────────────────
 const MIN_LOAN: Symbol = symbol_short!("MINLOAN"); // minimum loan amount in stroops
 const MAX_LOAN: Symbol = symbol_short!("MAXLOAN"); // maximum loan amount in stroops
+const MAX_EXTENSIONS: Symbol = symbol_short!("MAXEXT");
 
 // ── Issue #1046 storage key ───────────────────────────────────────────────────
 const LIQ_BONUS: Symbol = symbol_short!("LIQBONUS"); // liquidation bonus bps e.g. 500 = 5%
@@ -63,6 +99,7 @@ const LIQ_BONUS: Symbol = symbol_short!("LIQBONUS"); // liquidation bonus bps e.
 // ── Issue #669 storage keys ──────────────────────────────────────────────────
 const PNDG_WASM: Symbol = symbol_short!("PNDGWASM");
 const UPG_TIME: Symbol = symbol_short!("UPGTIME");
+const ACTIVE_WASM: Symbol = symbol_short!("ACT_WASM");
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -81,6 +118,9 @@ pub const DEFAULT_MIN_LOAN: i128 = 10_000_000;
 
 /// Default maximum loan amount: 1,000,000,000,000 stroops (100,000 XLM).
 pub const DEFAULT_MAX_LOAN: i128 = 1_000_000_000_000;
+
+/// Default maximum number of extensions allowed for one loan.
+pub const DEFAULT_MAX_EXTENSIONS: u32 = 3;
 
 // ── TTL management ───────────────────────────────────────────────────────────
 
@@ -148,8 +188,10 @@ pub enum Error {
     TimelockNotElapsed = 25,
     /// `remove_oracle` would leave zero oracles while active loans exist.
     OracleRequired = 26,
-    /// Loan amount exceeds the per-collateral-type maximum LTV ratio (#1044).
-    ExceedsMaxLtv = 27,
+    /// The loan health factor is below the safe extension threshold.
+    ExtensionDenied = 29,
+    /// The loan has reached the configured extension limit.
+    ExtensionLimitReached = 30,
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -298,6 +340,8 @@ pub enum DataKey {
     Guard,
     /// Liquidator whitelist entry keyed by address.
     WhitelistEntry(Address),
+    /// Number of extensions already granted for a loan.
+    ExtensionCount(u64),
     /// Per-animal-type maximum appraised value cap.
     AnimalCap(Symbol),
     /// Per-collateral-type maximum loan-to-value ratio in basis points (#1044).
@@ -399,6 +443,7 @@ impl StellarKraal {
         // Issue #700: loan amount limits (configurable, defaulting to 1 XLM / 100 000 XLM)
         env.storage().instance().set(&MIN_LOAN, &DEFAULT_MIN_LOAN);
         env.storage().instance().set(&MAX_LOAN, &DEFAULT_MAX_LOAN);
+        env.storage().instance().set(&MAX_EXTENSIONS, &DEFAULT_MAX_EXTENSIONS);
         Ok(())
     }
 
@@ -526,6 +571,10 @@ impl StellarKraal {
         env.storage().instance().set(&PAUSE_EXP, &expires_at);
         env.events().publish(
             (symbol_short!("Pause"), symbol_short!("activated")),
+            (admin.clone(), expires_at),
+        );
+        env.events().publish(
+            (Symbol::new(&env, "ContractPaused"),),
             (admin, expires_at),
         );
         Ok(())
@@ -550,8 +599,9 @@ impl StellarKraal {
         env.storage().instance().set(&PAUSE_EXP, &0u64);
         env.events().publish(
             (symbol_short!("Pause"), symbol_short!("lifted")),
-            (admin, true),
+            (admin.clone(), true),
         );
+        env.events().publish((Symbol::new(&env, "ContractUnpaused"),), admin);
         Ok(())
     }
 
@@ -605,6 +655,35 @@ impl StellarKraal {
         env.events()
             .publish((symbol_short!("Admin"), symbol_short!("AnimalCap")), (animal_type, max_value));
         Ok(())
+    }
+
+    pub fn set_min_collateral_value(
+        env: Env,
+        admin: Address,
+        min_value: i128,
+    ) -> Result<(), Error> {
+        Self::assert_initialized(&env)?;
+        Self::assert_admin(&env, &admin)?;
+        admin.require_auth();
+        if min_value <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let old_value: i128 = env
+            .storage()
+            .instance()
+            .get(&MIN_COLLATERAL)
+            .unwrap_or(DEFAULT_MIN_COLLATERAL);
+        env.storage().instance().set(&MIN_COLLATERAL, &min_value);
+        env.events().publish(
+            (symbol_short!("Admin"), symbol_short!("MinColl")),
+            (old_value, min_value),
+        );
+        Ok(())
+    }
+
+    pub fn get_min_collateral_value(env: Env) -> Result<i128, Error> {
+        Self::assert_initialized(&env)?;
+        Ok(env.storage().instance().get(&MIN_COLLATERAL).unwrap_or(DEFAULT_MIN_COLLATERAL))
     }
 
     // ── get_liquidation_threshold ─────────────────────────────────────────
@@ -677,6 +756,14 @@ impl StellarKraal {
         if appraised_value <= 0 || count == 0 {
             return Err(Error::InvalidAmount);
         }
+        let min_value: i128 = env
+            .storage()
+            .instance()
+            .get(&MIN_COLLATERAL)
+            .unwrap_or(DEFAULT_MIN_COLLATERAL);
+        if appraised_value < min_value {
+            return Err(Error::CollateralValueTooLow);
+        }
         if let Some(max_value) = env
             .storage()
             .persistent()
@@ -729,6 +816,7 @@ impl StellarKraal {
         new_value: i128,
     ) -> Result<(), Error> {
         Self::assert_initialized(&env)?;
+        Self::assert_not_paused(&env)?;
         caller.require_auth();
 
         if new_value <= 0 {
@@ -806,6 +894,18 @@ impl StellarKraal {
         }
         borrower.require_auth();
 
+        let now_sequence = env.ledger().sequence();
+        let cooldown: u32 = env.storage().instance().get(&LOAN_COOLDOWN).unwrap_or(DEFAULT_LOAN_COOLDOWN);
+        if let Some(last_sequence) = env
+            .storage()
+            .persistent()
+            .get::<_, u32>(&DataKey::LastLoanRequest(borrower.clone()))
+        {
+            if now_sequence.saturating_sub(last_sequence) < cooldown {
+                return Err(Error::CooldownActive);
+            }
+        }
+
         let mut total_collateral_value: i128 = 0;
         for col_id in collateral_ids.iter() {
             let collateral: CollateralRecord = env
@@ -840,10 +940,7 @@ impl StellarKraal {
         }
 
         let ltv: u32 = env.storage().instance().get(&LTV).unwrap();
-        let max_loan = total_collateral_value
-            .checked_mul(ltv as i128)
-            .ok_or(Error::InvalidAmount)?
-            / 10_000;
+        let max_loan = compute_ltv(total_collateral_value, ltv).ok_or(Error::InvalidAmount)?;
 
         if amount > max_loan {
             return Err(Error::InsufficientCollateral);
@@ -895,9 +992,25 @@ impl StellarKraal {
 
         token_client.transfer(&env.current_contract_address(), &borrower, &disbursement);
 
+        env.storage()
+            .persistent()
+            .set(&DataKey::LastLoanRequest(borrower.clone()), &now_sequence);
+        env.storage().persistent().extend_ttl(
+            &DataKey::LastLoanRequest(borrower.clone()),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_LEDGERS,
+        );
+
         env.events().publish(
             (symbol_short!("loan"), Symbol::new(&env, "requested")),
             (loan_id, borrower.clone(), amount, disbursement, total_collateral_value),
+        );
+        Self::publish_loan_transition(
+            &env,
+            loan_id,
+            &borrower,
+            Symbol::new(&env, "pending"),
+            Symbol::new(&env, "active"),
         );
 
         Ok(loan_id)
@@ -924,6 +1037,7 @@ impl StellarKraal {
         if loan.borrower != borrower {
             return Err(Error::Unauthorized);
         }
+        let previous_status = loan.status.clone();
         if loan.status != LoanStatus::Active {
             return Err(Error::LoanAlreadyClosed);
         }
@@ -985,8 +1099,93 @@ impl StellarKraal {
             (Symbol::new(&env, "loan_repaid"), borrower.clone()),
             (loan_id, principal_paid, interest_paid, loan.outstanding),
         );
+        Self::publish_loan_transition(
+            &env,
+            loan_id,
+            &borrower,
+            Self::status_symbol(&env, &previous_status),
+            Self::status_symbol(&env, &loan.status),
+        );
 
         Ok(())
+    }
+
+    pub fn set_max_extensions(env: Env, admin: Address, max_extensions: u32) -> Result<(), Error> {
+        Self::assert_initialized(&env)?;
+        Self::assert_admin(&env, &admin)?;
+        admin.require_auth();
+        env.storage().instance().set(&MAX_EXTENSIONS, &max_extensions);
+        Ok(())
+    }
+
+    pub fn get_max_extensions(env: Env) -> Result<u32, Error> {
+        Self::assert_initialized(&env)?;
+        Ok(env.storage().instance().get(&MAX_EXTENSIONS).unwrap_or(DEFAULT_MAX_EXTENSIONS))
+    }
+
+    pub fn request_extension(
+        env: Env,
+        borrower: Address,
+        loan_id: u64,
+        extra_ledgers: u64,
+    ) -> Result<u32, Error> {
+        Self::assert_initialized(&env)?;
+        Self::assert_not_paused(&env)?;
+        if extra_ledgers == 0 {
+            return Err(Error::InvalidAmount);
+        }
+        borrower.require_auth();
+
+        let mut loan: LoanRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Loan(loan_id))
+            .ok_or(Error::LoanNotFound)?;
+        if loan.borrower != borrower {
+            return Err(Error::Unauthorized);
+        }
+        if loan.status != LoanStatus::Active {
+            return Err(Error::LoanAlreadyClosed);
+        }
+
+        let extension_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ExtensionCount(loan_id))
+            .unwrap_or(0);
+        let max_extensions: u32 = env
+            .storage()
+            .instance()
+            .get(&MAX_EXTENSIONS)
+            .unwrap_or(DEFAULT_MAX_EXTENSIONS);
+        if extension_count >= max_extensions {
+            return Err(Error::ExtensionLimitReached);
+        }
+
+        let liquidation_threshold: u32 = env.storage().instance().get(&LIQ_THR).unwrap();
+        let health_factor = Self::compute_health_factor_with_thr(&loan, liquidation_threshold)?;
+        if health_factor < 10_000 {
+            return Err(Error::ExtensionDenied);
+        }
+
+        let current_deadline = loan.due_ledger.unwrap_or_else(|| env.ledger().timestamp());
+        let new_deadline = current_deadline
+            .checked_add(extra_ledgers)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let new_count = extension_count + 1;
+        loan.due_ledger = Some(new_deadline);
+        env.storage().persistent().set(&DataKey::Loan(loan_id), &loan);
+        env.storage().persistent().set(&DataKey::ExtensionCount(loan_id), &new_count);
+        env.storage().persistent().extend_ttl(
+            &DataKey::ExtensionCount(loan_id),
+            PERSISTENT_TTL_THRESHOLD,
+            PERSISTENT_TTL_LEDGERS,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "LoanExtended"),),
+            (loan_id, borrower, new_deadline, new_count),
+        );
+        Ok(new_count)
     }
 
     // ── liquidate ─────────────────────────────────────────────────────────
@@ -1014,6 +1213,7 @@ impl StellarKraal {
         if loan.status != LoanStatus::Active {
             return Err(Error::LoanAlreadyClosed);
         }
+        let previous_status = loan.status.clone();
 
         let liq_thr: u32 = env.storage().instance().get(&LIQ_THR).unwrap();
         let close_factor: u32 = env.storage().instance().get(&CLOSE_FACTOR).unwrap();
@@ -1068,6 +1268,13 @@ impl StellarKraal {
         env.events().publish(
             (symbol_short!("loan"), Symbol::new(&env, "liquidated")),
             (loan_id, liquidator.clone(), repay_amount, loan.outstanding, loan.status.clone()),
+        );
+        Self::publish_loan_transition(
+            &env,
+            loan_id,
+            &borrower,
+            Self::status_symbol(&env, &previous_status),
+            Self::status_symbol(&env, &loan.status),
         );
 
         env.events().publish(
@@ -1534,6 +1741,28 @@ impl StellarKraal {
         Ok((min_loan, max_loan))
     }
 
+    pub fn set_loan_cooldown(
+        env: Env,
+        admin: Address,
+        cooldown_ledgers: u32,
+    ) -> Result<(), Error> {
+        Self::assert_initialized(&env)?;
+        Self::assert_admin(&env, &admin)?;
+        admin.require_auth();
+
+        env.storage().instance().set(&LOAN_COOLDOWN, &cooldown_ledgers);
+        env.events().publish(
+            (symbol_short!("Admin"), symbol_short!("LoanCd")),
+            cooldown_ledgers,
+        );
+        Ok(())
+    }
+
+    pub fn get_loan_cooldown(env: Env) -> Result<u32, Error> {
+        Self::assert_initialized(&env)?;
+        Ok(env.storage().instance().get(&LOAN_COOLDOWN).unwrap_or(DEFAULT_LOAN_COOLDOWN))
+    }
+
     // ── get_ltv ──────────────────────────────────────────────────────────
     /// Return the current loan-to-value ratio in basis points.
     ///
@@ -1788,6 +2017,27 @@ impl StellarKraal {
         })
     }
 
+    // ── upgrade ───────────────────────────────────────────────────────────
+    /// Upgrade the contract WASM immediately when authorized by the admin.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        Self::assert_initialized(&env)?;
+        Self::assert_admin(&env, &admin)?;
+        admin.require_auth();
+
+        let old_wasm_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&ACTIVE_WASM)
+            .unwrap_or(BytesN::from_array(&env, &[0u8; 32]));
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+        env.storage().instance().set(&ACTIVE_WASM, &new_wasm_hash);
+        env.events().publish(
+            (Symbol::new(&env, "ContractUpgraded"), symbol_short!("upgrade")),
+            (old_wasm_hash, new_wasm_hash),
+        );
+        Ok(())
+    }
+
     // ── propose_upgrade ───────────────────────────────────────────────────
     /// Propose a WASM upgrade (Step 1 of two-step upgrade, issue #669).
     pub fn propose_upgrade(
@@ -1832,12 +2082,18 @@ impl StellarKraal {
         env.storage().persistent().remove(&DataKey::PendingWasm);
         env.storage().persistent().remove(&DataKey::UpgradeTime);
 
+        let old_wasm_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&ACTIVE_WASM)
+            .unwrap_or(BytesN::from_array(&env, &[0u8; 32]));
+        env.deployer().update_current_contract_wasm(wasm_hash.clone());
+        env.storage().instance().set(&ACTIVE_WASM, &wasm_hash);
         env.events().publish(
-            (symbol_short!("upgrade"), symbol_short!("executed")),
-            (wasm_hash.clone(), now),
+            (Symbol::new(&env, "ContractUpgraded"), symbol_short!("upgrade")),
+            (old_wasm_hash, wasm_hash.clone()),
         );
 
-        env.deployer().update_current_contract_wasm(wasm_hash);
         Ok(())
     }
 
@@ -2124,6 +2380,27 @@ impl StellarKraal {
     }
 
     // ── internal helpers ──────────────────────────────────────────────────
+    fn status_symbol(env: &Env, status: &LoanStatus) -> Symbol {
+        match status {
+            LoanStatus::Active => Symbol::new(env, "active"),
+            LoanStatus::Repaid => Symbol::new(env, "repaid"),
+            LoanStatus::Liquidated => Symbol::new(env, "liquidated"),
+        }
+    }
+
+    fn publish_loan_transition(
+        env: &Env,
+        loan_id: u64,
+        borrower: &Address,
+        from_status: Symbol,
+        to_status: Symbol,
+    ) {
+        env.events().publish(
+            (symbol_short!("loan"), Symbol::new(env, "transition")),
+            (loan_id, borrower.clone(), from_status, to_status, env.ledger().timestamp()),
+        );
+    }
+
     fn assert_initialized(env: &Env) -> Result<(), Error> {
         if !env.storage().instance().has(&ADMIN) {
             return Err(Error::NotInitialized);
