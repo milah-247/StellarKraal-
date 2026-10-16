@@ -28,33 +28,46 @@ docker info
 
 ### 2 — Start the full stack
 
-Run the following from the repository root. The `--build` flag rebuilds the
-backend/frontend images if you have local code changes:
+Observability services (`loki`, `promtail`, `prometheus`, `grafana`) run under
+the `monitoring` Docker Compose profile so that the default `docker compose up`
+stays lightweight for developers who do not need the observability stack.
+
+Run the following from the repository root to start everything, including the
+monitoring profile. The `--build` flag rebuilds backend/frontend images if you
+have local code changes:
+
+```bash
+docker compose --profile monitoring up --build
+```
+
+To start only the core services without observability:
 
 ```bash
 docker compose up --build
 ```
 
-On first run Docker pulls the Grafana, Loki, and Promtail images (~600 MB).
-Subsequent starts are much faster.
+On first run Docker pulls the Grafana, Loki, Prometheus, and Promtail images
+(~700 MB). Subsequent starts are much faster.
 
 Expected output once everything is healthy:
 
 ```
-loki_1     | level=info ts=... msg="Loki started"
-promtail_1 | level=info ts=... msg="Promtail started"
-backend_1  | Server running on port 3001
-grafana_1  | logger=http.server t=... msg="HTTP Server Listen" address=[::]:3000
+loki_1       | level=info ts=... msg="Loki started"
+promtail_1   | level=info ts=... msg="Promtail started"
+prometheus_1 | level=info ts=... msg="Server is ready to receive web requests."
+backend_1    | Server running on port 3001
+grafana_1    | logger=http.server t=... msg="HTTP Server Listen" address=[::]:3000
 ```
 
-> **Tip:** Run `docker compose up -d` to start in detached mode and keep your
-> terminal free.
+> **Tip:** Run `docker compose --profile monitoring up -d` to start in detached
+> mode and keep your terminal free.
 
 ### 3 — Verify each service
 
 | Service | URL | Expected response |
 |---------|-----|-------------------|
 | **Grafana** | http://localhost:3200 | Grafana login / home page |
+| **Prometheus** | http://localhost:9090 | Prometheus UI |
 | **Loki** | http://localhost:3100/ready | `ready` |
 | **Backend API** | http://localhost:3001/api/v1/health | `{"status":"ok"}` |
 | **Backend metrics** | http://localhost:3001/metrics | Prometheus text format |
@@ -77,9 +90,9 @@ grafana_1  | logger=http.server t=... msg="HTTP Server Listen" address=[::]:3000
 
 4. Click **StellarKraal Logs** to open the log dashboard.
 
-> **No data on metric panels?** Prometheus is not yet provisioned in
-> `docker-compose.yml` (see [Known Gaps](#known-gaps)). Log panels work
-> immediately without Prometheus.
+> **Metric panels showing "No data"?** Confirm Prometheus is running
+> (`docker compose --profile monitoring ps`) and that the backend target is
+> healthy at http://localhost:9090/targets.
 
 ### 5 — Import the loan dashboard JSON manually (optional)
 
@@ -168,13 +181,14 @@ incident review, set an absolute range that covers the event window.
 Stop all containers and remove the network:
 
 ```bash
-docker compose down
+docker compose --profile monitoring down
 ```
 
-To also delete the Grafana volume (resets all dashboard customisations):
+To also delete named volumes (resets Grafana customisations, Prometheus TSDB,
+**and PostgreSQL data**):
 
 ```bash
-docker compose down -v
+docker compose --profile monitoring down -v
 ```
 
 ---
@@ -201,18 +215,19 @@ backend ──► prom-client registry ──► GET /metrics ──► Promethe
 
 ### Local development
 
-All services are defined in `docker-compose.yml`. Start the full stack:
+All observability services are defined in `docker-compose.yml` under the
+`monitoring` profile. Start the full stack (core + observability) with:
 
 ```bash
-docker compose up --build
+docker compose --profile monitoring up --build
 ```
 
 | Service | URL | Credentials |
 |---------|-----|-------------|
 | Grafana | http://localhost:3200 | Anonymous viewer (no login) |
+| Prometheus | http://localhost:9090 | — |
 | Loki | http://localhost:3100 | — |
 | Backend API | http://localhost:3001 | — |
-| Prometheus | (not yet provisioned — see [Known Gaps](#known-gaps)) | — |
 
 ### Staging
 
@@ -398,7 +413,7 @@ Promtail extracts these labels from container metadata:
 | **DB Pool — Acquire Wait Latency (p95)** — bottom-centre timeseries | Rising wait time is the early warning signal before pool exhaustion. Investigate if p95 exceeds 50 ms. |
 | **Alert Rules** — bottom-right text panel | Live Markdown table of all Prometheus alert rules. Red rows indicate currently firing alerts. |
 
-> **Note on empty panels:** The *Request Rate*, *Error Rate*, *Latency*, and *RPC* panels require a running Prometheus instance. See [Known Gaps](#known-gaps) if these panels show "No data".
+> **Note on empty panels:** The *Request Rate*, *Error Rate*, *Latency*, and *RPC* panels require Prometheus to be running. Start the monitoring profile with `docker compose --profile monitoring up --build` and verify the backend target is healthy at http://localhost:9090/targets.
 
 ---
 
@@ -480,10 +495,10 @@ The logs dashboard (`grafana/dashboards/logs.json`) contains the following panel
 
 ### Accessing dashboards
 
-1. Start the stack: `docker compose up --build`
+1. Start the stack with the monitoring profile: `docker compose --profile monitoring up --build`
 2. Open Grafana: http://localhost:3200
 3. Navigate to **Dashboards** in the sidebar:
-   - **StellarKraal Backend** — real-time metrics (requires Prometheus; see Known Gaps)
+   - **StellarKraal Backend** — real-time metrics from Prometheus
    - **StellarKraal Logs** — live log streaming from Loki
 
 ---
@@ -610,11 +625,18 @@ To export the updated dashboard JSON back to the repo:
 
 ### Docker Compose services
 
-| Service | Image | Port | Config |
-|---------|-------|------|--------|
-| `loki` | `grafana/loki:2.9.4` | 3100 | Built-in local config |
-| `promtail` | `grafana/promtail:2.9.4` | 9080 (internal) | `observability/promtail-config.yml` |
-| `grafana` | `grafana/grafana:10.4.2` | 3200 → 3000 | Datasource + dashboard provisioning |
+| Service | Image | Port | Profile | Config |
+|---------|-------|------|---------|--------|
+| `loki` | `grafana/loki:2.9.4` | 3100 | `monitoring` | Built-in local config |
+| `promtail` | `grafana/promtail:2.9.4` | 9080 (internal) | `monitoring` | `observability/promtail-config.yml` |
+| `prometheus` | `prom/prometheus:v2.51.2` | 9090 | `monitoring` | `observability/prometheus.yml` |
+| `grafana` | `grafana/grafana:10.4.2` | 3200 → 3000 | `monitoring` | Datasource + dashboard provisioning |
+
+Start the monitoring profile:
+
+```bash
+docker compose --profile monitoring up --build
+```
 
 ### Grafana provisioning
 
@@ -692,8 +714,6 @@ The following items are identified gaps in the current observability setup:
 
 | Gap | Impact | Workaround |
 |-----|--------|------------|
-| **No Prometheus service** in `docker-compose.yml` | Backend dashboard panels are empty in local dev | Deploy Prometheus locally or use Grafana Cloud |
-| **No Prometheus datasource** in `grafana-dashboards.yml` | Grafana cannot query Prometheus metrics | Add a Prometheus datasource pointing to your Prometheus instance |
 | **`rpc_call_duration_seconds`** is defined but not instrumented | RPC latency panels are empty | Instrument the RPC client wrapper in `utils/rpcClient.ts` |
 | **`stellarkraal_alert_fired`** metric referenced in alert rules is not emitted | 6 of 9 alerts will never fire | Emit the metric from `fireAlert()` in `utils/alerting.ts` |
 
@@ -713,8 +733,9 @@ documentation update.
 | `backend/src/utils/alerting.ts` | Alert dispatch (Slack + PagerDuty) |
 | `backend/src/utils/alertRules.ts` | Alert rule definitions (source of truth) |
 | `observability/promtail-config.yml` | Promtail scrape + pipeline config |
-| `observability/grafana-datasources.yml` | Grafana datasource provisioning |
+| `observability/grafana-datasources.yml` | Grafana datasource provisioning (Loki + Prometheus) |
 | `observability/grafana-dashboards.yml` | Grafana dashboard provisioning |
+| `observability/prometheus.yml` | Prometheus scrape config (local dev) |
 | `observability/prometheus-rules.yml` | Prometheus alert rules (auto-generated) |
 | `grafana/dashboards/backend.json` | Backend metrics dashboard |
 | `grafana/dashboards/logs.json` | Log streaming dashboard |
