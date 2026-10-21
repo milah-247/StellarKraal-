@@ -5,9 +5,12 @@ import { useParams, useRouter } from 'next/navigation';
 import dynamic from 'next/dynamic';
 import ErrorState from '@/components/ErrorState';
 import DetailSkeleton from '@/components/DetailSkeleton';
+import Breadcrumb from '@/components/Breadcrumb';
 import HealthGauge, { SkeletonHealthGauge } from '@/components/HealthGauge';
 import HealthFactorAlert from '@/components/HealthFactorAlert';
 import { useHealthFactor } from '@/hooks/useHealthFactor';
+import PrintButton from '@/components/PrintButton';
+import PrintButton from '@/components/PrintButton';
 
 // Heavy component — loaded lazily to reduce initial JS bundle (#1070)
 const LoanRepaymentCalculator = dynamic(() => import('@/components/LoanRepaymentCalculator'), {
@@ -265,8 +268,10 @@ export default function LoanDetailPage() {
 
   return (
     <main
-      className={`mx-auto max-w-2xl px-4 py-10 ${loan.status === 'active' ? 'pb-44 sm:pb-10' : ''}`}
+      className={`mx-auto max-w-2xl px-4 py-10 print-header ${loan.status === 'active' ? 'pb-44 sm:pb-10' : ''}`}
+      data-print-date={new Date().toLocaleDateString()}
     >
+      <Breadcrumb />
       <Link href="/loans" className="text-brown/60 hover:text-brown text-sm mb-6 inline-block">
         ← Back to Loans
       </Link>
@@ -276,7 +281,7 @@ export default function LoanDetailPage() {
         <div className="flex items-center gap-2 mb-4">
           <span className="text-brown/50 text-sm">Loan ID</span>
           <button
-            onClick={() => void copyId(loan.id)}
+            onClick={() => void copyId()}
             aria-label={copied ? 'Loan ID copied' : 'Copy loan ID'}
             title={copied ? 'Copied!' : 'Copy ID'}
             className="shrink-0 text-brown/50 hover:text-brown transition focus:outline-none focus-visible:ring-2 focus-visible:ring-brown rounded"
@@ -333,11 +338,7 @@ export default function LoanDetailPage() {
       {loan.status === 'active' && (
         <>
           {/* Real-time health factor gauge + alert banners */}
-          <section
-            aria-label="Health factor"
-            className="mb-6"
-            data-testid="health-factor-section"
-          >
+          <section aria-label="Health factor" className="mb-6" data-testid="health-factor-section">
             <div className="bg-white rounded-2xl p-6 shadow">
               <div className="flex items-center justify-between mb-3">
                 <h2 className="text-lg font-semibold text-brown">Health Factor</h2>
